@@ -608,6 +608,22 @@ impl<'a> FluentPageBuilder<'a> {
         super::streaming_table::StreamingTable::open(self, config)
     }
 
+    /// Width of `text` in `font_name` at `size`, in PDF points. Embedded
+    /// fonts registered on the document win — their real glyph advances
+    /// (HMTX) are used. Only when the name is not an embedded font does
+    /// this fall through to the AFM-backed Base-14 font manager, whose
+    /// Helvetica fallback would otherwise silently mis-measure embedded
+    /// faces (bold DejaVu vs Helvetica differs by ~10–15%, visibly
+    /// overlapping adjacent runs).
+    pub(crate) fn text_width_of(&self, text: &str, font_name: &str, size: f32) -> f32 {
+        if let Some(font) = self.builder.embedded_font(font_name) {
+            return font.text_width(text, size);
+        }
+        self.text_layout
+            .font_manager()
+            .text_width(text, font_name, size)
+    }
+
     /// Measure the rendered width of `text` in the builder's current font
     /// and size, in PDF points. Pure query — does not advance the cursor or
     /// emit any content.
@@ -617,20 +633,13 @@ impl<'a> FluentPageBuilder<'a> {
     /// embedded fonts, the measure honours the face's horizontal advances
     /// (HMTX). For base-14 fonts, it uses the AFM width tables.
     pub fn measure(&self, text: &str) -> f32 {
-        self.text_layout.font_manager().text_width(
-            text,
-            &self.text_config.font,
-            self.text_config.size,
-        )
+        self.text_width_of(text, &self.text_config.font, self.text_config.size)
     }
 
     /// Add text at the current cursor position.
     pub fn text(mut self, text: &str) -> Self {
-        let text_width = self.text_layout.font_manager().text_width(
-            text,
-            &self.text_config.font,
-            self.text_config.size,
-        );
+        let text_width =
+            self.text_width_of(text, &self.text_config.font, self.text_config.size);
 
         // Create the bounding box and track it for potential markup annotations
         let text_rect = Rect::new(self.cursor_x, self.cursor_y, text_width, self.text_config.size);
@@ -1022,10 +1031,7 @@ impl<'a> FluentPageBuilder<'a> {
         let base_size = self.text_config.size;
         let ref_size = (base_size * 0.65).max(6.0);
 
-        let ref_w =
-            self.text_layout
-                .font_manager()
-                .text_width(ref_mark, &self.text_config.font, ref_size);
+        let ref_w = self.text_width_of(ref_mark, &self.text_config.font, ref_size);
 
         let page = &mut self.builder.pages[self.page_index];
         let reading_order = page.elements.len();
@@ -1233,11 +1239,7 @@ impl<'a> FluentPageBuilder<'a> {
             // below (unchanged) — spacing between runs is guaranteed here
             // instead of relying on the caller to pad it correctly.
             if run_idx > 0 && (self.cursor_x - left_margin).abs() > 0.01 {
-                let space_w = self.text_layout.font_manager().text_width(
-                    " ",
-                    &font_name,
-                    self.text_config.size,
-                );
+                let space_w = self.text_width_of(" ", &font_name, self.text_config.size);
                 if self.cursor_x + space_w <= max_right {
                     self.cursor_x += space_w;
                 } else {
@@ -1259,11 +1261,7 @@ impl<'a> FluentPageBuilder<'a> {
                 } else {
                     format!("{} {}", buf, word)
                 };
-                let cw = self.text_layout.font_manager().text_width(
-                    &candidate,
-                    &font_name,
-                    self.text_config.size,
-                );
+                let cw = self.text_width_of(&candidate, &font_name, self.text_config.size);
                 if self.cursor_x + cw > max_right && !buf.is_empty() {
                     // Auto-paginate when next line would land below bottom margin.
                     let line_height = self.text_config.size * self.text_config.line_height;
@@ -1271,11 +1269,7 @@ impl<'a> FluentPageBuilder<'a> {
                         self.new_page_same_size_inplace();
                     }
                     // Emit buf as a line
-                    let bw = self.text_layout.font_manager().text_width(
-                        &buf,
-                        &font_name,
-                        self.text_config.size,
-                    );
+                    let bw = self.text_width_of(&buf, &font_name, self.text_config.size);
                     let reading_order = self.builder.pages[self.page_index].elements.len();
                     self.builder.pages[self.page_index]
                         .elements
@@ -1314,11 +1308,7 @@ impl<'a> FluentPageBuilder<'a> {
             }
             // Emit any remaining words
             if !buf.is_empty() {
-                let bw = self.text_layout.font_manager().text_width(
-                    &buf,
-                    &font_name,
-                    self.text_config.size,
-                );
+                let bw = self.text_width_of(&buf, &font_name, self.text_config.size);
                 let reading_order = self.builder.pages[self.page_index].elements.len();
                 self.builder.pages[self.page_index]
                     .elements
@@ -1361,10 +1351,7 @@ impl<'a> FluentPageBuilder<'a> {
         color: Option<crate::layout::Color>,
     ) {
         let font_name = font_override.unwrap_or_else(|| self.text_config.font.clone());
-        let w = self
-            .text_layout
-            .font_manager()
-            .text_width(text, &font_name, self.text_config.size);
+        let w = self.text_width_of(text, &font_name, self.text_config.size);
         let reading_order = self.builder.pages[self.page_index].elements.len();
         self.builder.pages[self.page_index]
             .elements
@@ -2937,6 +2924,17 @@ impl DocumentBuilder {
     pub fn register_embedded_font(mut self, name: impl Into<String>, font: EmbeddedFont) -> Self {
         self.embedded_fonts.push((name.into(), font));
         self
+    }
+
+    /// Look up a registered embedded font by the user-visible name it was
+    /// registered under. Measurement helpers consult this first so widths
+    /// come from the face's real glyph advances instead of a Base-14
+    /// fallback.
+    pub fn embedded_font(&self, name: &str) -> Option<&EmbeddedFont> {
+        self.embedded_fonts
+            .iter()
+            .find(|(registered, _)| registered == name)
+            .map(|(_, font)| font)
     }
 
     /// Set document title (convenience passthrough to

@@ -4,7 +4,9 @@
 
 use crate::converters::ConversionOptions;
 use crate::editor::{DocumentEditor, EditableDocument, PdfPage};
+use crate::elements::{ContentElement, PathContent, PathOperation};
 use crate::error::{Error, Result};
+use crate::geometry::Rect;
 use crate::writer::{DocumentBuilder, DocumentMetadata, PageSize};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -3304,28 +3306,14 @@ impl PdfBuilder {
             }
         }
 
-        // Parse and render Markdown
-        let (_page_width, page_height) = self.config.page_size.dimensions();
-        let start_y = page_height - self.config.margin_top;
-
         // Resolve the font family up front. The Unicode path embeds DejaVu
         // (regular + bold registered above); the ASCII path uses the
         // Base-14 Helvetica family plus Courier for code — all
-        // auto-registered by the font manager, so nothing to embed there.
-        // Italic on the Unicode path degrades to regular/bold (no oblique
-        // DejaVu is bundled); headings/bold still apply correctly.
+        // auto-registered by the font manager. Italic on the Unicode path
+        // degrades to regular/bold (no oblique DejaVu is bundled).
         //
-        // `mono_font` on the Unicode path is **Courier**, not
-        // `DejaVuSans` — DejaVuSans is proportional, which would break
-        // alignment in fenced code blocks and GFM tables (both of which
-        // rely on space-padding for visual layout). Courier is monospace
-        // and ASCII-safe; the trade-off is that non-ASCII characters
-        // inside code spans/blocks render as missing glyphs (WinAnsi
-        // can't represent them). DejaVuSansMono isn't bundled because
-        // it would add ~330 KB to the wasm artifact for a fallback that
-        // matters only for non-ASCII code, and the alignment loss in
-        // the much more common ASCII-code-in-Unicode-prose case is the
-        // more visible bug.
+        // `mono_font` is **Courier** on both paths: code blocks and table
+        // cells rely on monospace alignment, and DejaVuSans would break it.
         let (body_font, bold_font, italic_font, bolditalic_font, mono_font): (
             &'static str,
             &'static str,
@@ -3358,10 +3346,22 @@ impl PdfBuilder {
             }
         };
 
-        // A laid-out run: absolute baseline plus the font/size it must be
-        // shown with. Inline emphasis is resolved here so one source line
-        // can fan out into several differently-styled runs sharing a `y`.
-        struct LaidRun {
+        let font_manager = crate::writer::FontManager::new();
+        let (page_width, page_height) = self.config.page_size.dimensions();
+        let start_y = page_height - self.config.margin_top;
+        let left = self.config.margin_left;
+        let bottom = self.config.margin_bottom;
+        let max_x = page_width - self.config.margin_right;
+        let text_area = max_x - left;
+
+        // One width oracle for the whole layout pass: embedded fonts win
+        // (their real HMTX advances), Base-14 falls through to the AFM
+        // tables. Without the embedded branch, DejaVu text measures as
+        // Helvetica and bold/regular run transitions overlap.
+
+        /// One positioned text run (absolute baseline) or a stroked rule,
+        /// ready for the emit pass.
+        struct LaidText {
             x0: f32,
             y: f32,
             text: String,
@@ -3369,154 +3369,656 @@ impl PdfBuilder {
             size: f32,
             first: bool,
         }
-
-        let mut runs_out: Vec<LaidRun> = Vec::new();
-        let mut y = start_y;
-        let mut in_code = false;
-
-        // Collect all lines for table detection
-        let lines: Vec<&str> = content.lines().collect();
-        let mut i = 0;
-
-        while i < lines.len() {
-            let line = lines[i];
-
-            // Check if this starts a table (need at least header + separator)
-            if !in_code && is_table_line(line) && i + 1 < lines.len() {
-                // Collect consecutive table lines
-                let mut table_lines = vec![line];
-                let mut j = i + 1;
-                while j < lines.len() && is_table_line(lines[j]) {
-                    table_lines.push(lines[j]);
-                    j += 1;
-                }
-
-                // Try to parse as GFM table. Rendered monospace so the
-                // column padding actually lines up.
-                if let Some(table) = GfmTable::parse(&table_lines) {
-                    let table_font_size = self.config.font_size * 0.9;
-                    let line_height = table_font_size * self.config.line_height;
-
-                    y -= line_height * 0.5;
-                    for table_line in table.render() {
-                        y -= line_height;
-                        if y < self.config.margin_bottom {
-                            y = start_y - line_height;
-                        }
-                        runs_out.push(LaidRun {
-                            x0: self.config.margin_left,
-                            y,
-                            text: table_line,
-                            font: mono_font,
-                            size: table_font_size,
-                            first: true,
-                        });
-                    }
-                    y -= line_height * 0.5;
-
-                    i = j; // Skip all table lines
-                    continue;
-                }
-            }
-
-            // Fenced code-block toggle.
-            if line.starts_with("```") {
-                in_code = !in_code;
-                y -= self.config.font_size * self.config.line_height;
-                i += 1;
-                continue;
-            }
-
-            // Classify the block: (content, point-size, force-bold, indent).
-            // `heading_bold` renders the whole line in the bold face.
-            let (block_text, size, heading_bold, indent) = if in_code {
-                (line.to_string(), self.config.font_size * 0.9, false, 0.0)
-            } else if let Some(rest) = line.strip_prefix("#### ") {
-                (rest.to_string(), self.config.font_size * 1.1, true, 0.0)
-            } else if let Some(rest) = line.strip_prefix("### ") {
-                (rest.to_string(), self.config.font_size * 1.25, true, 0.0)
-            } else if let Some(rest) = line.strip_prefix("## ") {
-                (rest.to_string(), self.config.font_size * 1.5, true, 0.0)
-            } else if let Some(rest) = line.strip_prefix("# ") {
-                (rest.to_string(), self.config.font_size * 2.0, true, 0.0)
-            } else if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
-                (format!("\u{2022} {rest}"), self.config.font_size, false, 0.0)
-            } else if let Some(rest) = line.strip_prefix("> ") {
-                (rest.to_string(), self.config.font_size, false, 12.0)
-            } else if line.trim().is_empty() {
-                y -= self.config.font_size * self.config.line_height;
-                i += 1;
-                continue;
-            } else {
-                (line.to_string(), self.config.font_size, false, 0.0)
-            };
-
-            let line_height = size * self.config.line_height;
-            y -= line_height;
-            if y < self.config.margin_bottom {
-                y = start_y - line_height;
-            }
-
-            // Inside a fenced code block the line is verbatim — no inline
-            // parsing (back-ticks etc. are literal there).
-            let parsed = if in_code {
-                vec![InlineRun {
-                    text: block_text,
-                    bold: false,
-                    italic: false,
-                    code: true,
-                }]
-            } else {
-                parse_inline_runs(&block_text)
-            };
-
-            let x0 = self.config.margin_left + indent;
-            let mut first = true;
-            for r in &parsed {
-                if r.text.is_empty() {
-                    continue;
-                }
-                runs_out.push(LaidRun {
-                    x0,
-                    y,
-                    text: r.text.clone(),
-                    font: font_for(r, heading_bold),
-                    size,
-                    first,
-                });
-                first = false;
-            }
-
-            i += 1;
+        struct LaidRule {
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
+            width: f32,
+            gray: f32,
         }
+        enum LaidItem {
+            Text(LaidText),
+            Rule(LaidRule),
+        }
+        type Seg = (String, &'static str, f32);
 
-        // Emit. A run whose baseline rose above the previous one marks a
-        // page break the layout loop introduced when it ran out of space.
-        // Successive runs on the same line share `y`; `first` resets the
-        // horizontal pen, and each run advances it by its measured width
-        // so inline style changes stay visually contiguous.
+        let items: Vec<LaidItem> = {
+            let measure = |text: &str, font: &str, size: f32| -> f32 {
+                if let Some(embedded) = builder.embedded_font(font) {
+                    return embedded.text_width(text, size);
+                }
+                font_manager.text_width(text, font, size)
+            };
+            let font_for_ref = &font_for;
+
+            /// Vertical cursor: advances line by line, restarting at the
+            /// top when a line would cross the bottom margin. The restart
+            /// (y jumping back up) is what the emit pass reads as a page
+            /// break.
+            struct Flow {
+                y: f32,
+            }
+            impl Flow {
+                fn line(&mut self, lh: f32, start_y: f32, bottom: f32) {
+                    self.y -= lh;
+                    if self.y < bottom {
+                        self.y = start_y - lh;
+                    }
+                }
+            }
+
+            fn rule(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, gray: f32) -> LaidItem {
+                LaidItem::Rule(LaidRule {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    width,
+                    gray,
+                })
+            }
+
+            /// Greedy word wrap across styled runs. Spaces are appended to
+            /// the preceding segment's text so the emit pass's per-segment
+            /// measure reproduces exact inter-word and inter-style gaps.
+            fn wrap_runs(
+                runs: &[InlineRun],
+                heading_bold: bool,
+                size: f32,
+                width_first: f32,
+                width_rest: f32,
+                measure: &dyn Fn(&str, &str, f32) -> f32,
+                font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
+            ) -> Vec<Vec<Seg>> {
+                let mut lines: Vec<Vec<Seg>> = Vec::new();
+                let mut cur: Vec<Seg> = Vec::new();
+                let mut cur_w = 0.0f32;
+                let mut avail = width_first;
+                for run in runs {
+                    let font = font_for(run, heading_bold);
+                    for word in run.text.split_whitespace() {
+                        // Punctuation-only tokens — the `,` of
+                        // `**bold**, regular` arrives as its own token from
+                        // the next run — glue onto the previous word: a
+                        // comma or closing bracket never starts a line.
+                        if !cur.is_empty()
+                            && word.len() <= 2
+                            && word.chars().all(|c| {
+                                matches!(
+                                    c,
+                                    ',' | '.' | ';' | ':' | '!' | '?' | ')' | '\u{201D}'
+                                        | '\u{00BB}'
+                                )
+                            })
+                        {
+                            cur.last_mut().unwrap().0.push_str(word);
+                            cur_w += measure(word, font, size);
+                            continue;
+                        }
+                        let ww = measure(word, font, size);
+                        let sp_w = match cur.last() {
+                            Some(last) => measure(" ", last.1, last.2),
+                            None => 0.0,
+                        };
+                        if !cur.is_empty() && cur_w + sp_w + ww > avail {
+                            lines.push(std::mem::take(&mut cur));
+                            cur_w = 0.0;
+                            avail = width_rest;
+                        }
+                        match cur.last_mut() {
+                            Some(last) if last.1 == font && (last.2 - size).abs() < f32::EPSILON => {
+                                last.0.push(' ');
+                                last.0.push_str(word);
+                                cur_w += sp_w + ww;
+                            },
+                            Some(last) => {
+                                last.0.push(' ');
+                                cur_w += sp_w;
+                                cur.push((word.to_string(), font, size));
+                                cur_w += ww;
+                            },
+                            None => {
+                                cur.push((word.to_string(), font, size));
+                                cur_w = ww;
+                            },
+                        }
+                    }
+                }
+                if !cur.is_empty() {
+                    lines.push(cur);
+                }
+                lines
+            }
+
+            /// Single-line width of a run sequence (for natural column
+            /// widths).
+            fn runs_width(
+                runs: &[InlineRun],
+                heading_bold: bool,
+                size: f32,
+                measure: &dyn Fn(&str, &str, f32) -> f32,
+                font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
+            ) -> f32 {
+                runs.iter()
+                    .map(|r| measure(r.text.trim(), font_for(r, heading_bold), size))
+                    .sum()
+            }
+
+            /// Widest single word in a run sequence (column minimum, so a
+            /// word is never split across lines).
+            fn longest_word(
+                runs: &[InlineRun],
+                heading_bold: bool,
+                size: f32,
+                measure: &dyn Fn(&str, &str, f32) -> f32,
+                font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
+            ) -> f32 {
+                runs.iter()
+                    .flat_map(|r| {
+                        let font = font_for(r, heading_bold);
+                        r.text
+                            .split_whitespace()
+                            .map(move |w| (w, font))
+                    })
+                    .map(|(w, font)| measure(w, font, size))
+                    .fold(0.0f32, f32::max)
+            }
+
+            /// Wrapped-line count of a cell (row height driver).
+            fn cell_line_count(
+                cell: &str,
+                width: f32,
+                size: f32,
+                measure: &dyn Fn(&str, &str, f32) -> f32,
+                font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
+            ) -> usize {
+                let runs = parse_inline_runs(cell);
+                wrap_runs(&runs, false, size, width, width, measure, font_for)
+                    .len()
+                    .max(1)
+            }
+
+            /// Place one wrapped block of styled runs under `flow`.
+            #[allow(clippy::too_many_arguments)]
+            fn emit_block(
+                items: &mut Vec<LaidItem>,
+                flow: &mut Flow,
+                lines: Vec<Vec<Seg>>,
+                x0: f32,
+                cont_x0: f32,
+                lh: f32,
+                start_y: f32,
+                bottom: f32,
+            ) {
+                for (li, line) in lines.iter().enumerate() {
+                    flow.line(lh, start_y, bottom);
+                    let x = if li == 0 { x0 } else { cont_x0 };
+                    let mut first = true;
+                    for (text, font, size) in line {
+                        items.push(LaidItem::Text(LaidText {
+                            x0: x,
+                            y: flow.y,
+                            text: text.clone(),
+                            font,
+                            size: *size,
+                            first,
+                        }));
+                        first = false;
+                    }
+                }
+            }
+
+            /// Draw one table row at the flow cursor. `bold` styles the
+            /// whole row (header). Returns the row's top y.
+            #[allow(clippy::too_many_arguments)]
+            fn draw_row(
+                items: &mut Vec<LaidItem>,
+                flow: &mut Flow,
+                cells: &[String],
+                widths: &[f32],
+                aligns: &[GfmAlign],
+                bold: bool,
+                left: f32,
+                pad_x: f32,
+                pad_y: f32,
+                fs: f32,
+                cell_lh: f32,
+                start_y: f32,
+                bottom: f32,
+                measure: &dyn Fn(&str, &str, f32) -> f32,
+                font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
+            ) -> f32 {
+                let ncols = widths.len();
+                let mut wrapped: Vec<Vec<Vec<Seg>>> = Vec::with_capacity(ncols);
+                let mut max_lines = 1usize;
+                for ci in 0..ncols {
+                    let cell = cells.get(ci).map(String::as_str).unwrap_or("");
+                    let runs = parse_inline_runs(cell);
+                    let lines = wrap_runs(&runs, bold, fs, widths[ci], widths[ci], measure, font_for);
+                    max_lines = max_lines.max(lines.len().max(1));
+                    wrapped.push(lines);
+                }
+                let h = max_lines as f32 * cell_lh + 2.0 * pad_y;
+                flow.y -= h;
+                if flow.y < bottom {
+                    flow.y = start_y - h;
+                }
+                let row_top = flow.y + h;
+
+                // Vertical separators, drawn per row so page breaks never
+                // strand a line.
+                let mut bx = left;
+                for ci in 0..=ncols {
+                    items.push(rule(bx, row_top, bx, row_top - h, 0.4, 0.80));
+                    if ci < ncols {
+                        bx += widths[ci] + 2.0 * pad_x;
+                    }
+                }
+
+                for (ci, lines) in wrapped.iter().enumerate() {
+                    let x_cell =
+                        left + widths[..ci].iter().sum::<f32>() + 2.0 * pad_x * ci as f32 + pad_x;
+                    for (li, line) in lines.iter().enumerate() {
+                        let line_w: f32 =
+                            line.iter().map(|(t, f, s)| measure(t, f, *s)).sum();
+                        let y = row_top - pad_y - (li as f32 + 0.82) * cell_lh;
+                        let x = match aligns.get(ci).copied().unwrap_or(GfmAlign::Left) {
+                            GfmAlign::Right => x_cell + widths[ci] - line_w,
+                            GfmAlign::Center => x_cell + (widths[ci] - line_w) / 2.0,
+                            GfmAlign::Left => x_cell,
+                        };
+                        let mut first = true;
+                        for (text, font, size) in line {
+                            items.push(LaidItem::Text(LaidText {
+                                x0: x,
+                                y,
+                                text: text.clone(),
+                                font,
+                                size: *size,
+                                first,
+                            }));
+                            first = false;
+                        }
+                    }
+                }
+                row_top
+            }
+
+            // ---- block flow ----
+            let fs = self.config.font_size;
+            let body_lh = fs * self.config.line_height;
+            let mut flow = Flow { y: start_y };
+            let mut items: Vec<LaidItem> = Vec::new();
+            let mut in_code = false;
+            let mut first_block = true;
+
+            let lines: Vec<&str> = content.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let line = lines[i];
+
+                // GFM table: header + separator + data rows.
+                if !in_code && is_table_line(line) && i + 1 < lines.len() {
+                    let mut table_lines = vec![line];
+                    let mut j = i + 1;
+                    while j < lines.len() && is_table_line(lines[j]) {
+                        table_lines.push(lines[j]);
+                        j += 1;
+                    }
+                    if let Some(table) = GfmTable::parse(&table_lines) {
+                        let cell_fs = fs * 0.95;
+                        let cell_lh = cell_fs * 1.35;
+                        let (pad_x, pad_y) = (5.0f32, 3.5f32);
+                        let ncols = table.headers.len().max(1);
+
+                        // Natural (single-line) and minimum (longest word)
+                        // content widths per column.
+                        let mut natural = vec![0.0f32; ncols];
+                        let mut min_w = vec![0.0f32; ncols];
+                        for row in
+                            std::iter::once(&table.headers).chain(table.rows.iter())
+                        {
+                            for (ci, cell) in row.iter().enumerate().take(ncols) {
+                                let runs = parse_inline_runs(cell);
+                                natural[ci] = natural[ci]
+                                    .max(runs_width(&runs, false, cell_fs, &measure, font_for_ref));
+                                min_w[ci] = min_w[ci].max(longest_word(
+                                    &runs, false, cell_fs, &measure, font_for_ref,
+                                ));
+                            }
+                        }
+
+                        // Fit columns into the text area; wrap cells only
+                        // when the natural widths cannot fit.
+                        let grid = text_area - 2.0 * pad_x * ncols as f32;
+                        let mut widths = natural.clone();
+                        let total: f32 = widths.iter().sum();
+                        if total > grid && total > 0.0 {
+                            let scale = grid / total;
+                            for w in widths.iter_mut() {
+                                *w = (*w * scale).max(1.0);
+                            }
+                            for (w, mw) in widths.iter_mut().zip(&min_w) {
+                                if *w < *mw {
+                                    *w = *mw;
+                                }
+                            }
+                            let mut guard = 0;
+                            loop {
+                                let sum: f32 = widths.iter().sum();
+                                if sum <= grid || guard > 10_000 {
+                                    break;
+                                }
+                                guard += 1;
+                                let flexible = widths
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(ci, w)| **w > min_w[*ci] + 0.5)
+                                    .max_by(|a, b| a.1.partial_cmp(b.1).unwrap());
+                                match flexible {
+                                    Some((idx, _)) => widths[idx] -= 1.0,
+                                    None => break,
+                                }
+                            }
+                        }
+
+                        // Gap above the table, then the bordered header.
+                        flow.y -= cell_fs * 0.7;
+                        let draw_header = |items: &mut Vec<LaidItem>, flow: &mut Flow| {
+                            // Top border first: items must stay in
+                            // descending-y order or the emit pass reads the
+                            // rise as a page break.
+                            items.push(rule(
+                                left,
+                                flow.y,
+                                max_x,
+                                flow.y,
+                                0.75,
+                                0.35,
+                            ));
+                            draw_row(
+                                items, flow, &table.headers, &widths, &table.alignments, true,
+                                left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
+                                &measure, font_for_ref,
+                            );
+                            items.push(rule(left, flow.y, max_x, flow.y, 0.6, 0.55));
+                        };
+                        draw_header(&mut items, &mut flow);
+
+                        for row in &table.rows {
+                            // Repeat the header on a fresh page when the
+                            // next row cannot fit whole.
+                            let need = row
+                                .iter()
+                                .enumerate()
+                                .take(ncols)
+                                .map(|(ci, c)| {
+                                    cell_line_count(
+                                        c,
+                                        widths.get(ci).copied().unwrap_or(1.0),
+                                        cell_fs,
+                                        &measure,
+                                        font_for_ref,
+                                    )
+                                })
+                                .max()
+                                .unwrap_or(1) as f32
+                                * cell_lh
+                                + 2.0 * pad_y;
+                            if flow.y - need < bottom {
+                                flow.y = start_y;
+                                draw_header(&mut items, &mut flow);
+                            }
+                            draw_row(
+                                &mut items, &mut flow, row, &widths, &table.alignments, false,
+                                left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
+                                &measure, font_for_ref,
+                            );
+                            items.push(rule(left, flow.y, max_x, flow.y, 0.35, 0.82));
+                        }
+                        items.push(rule(left, flow.y, max_x, flow.y, 0.75, 0.35));
+                        flow.y -= cell_fs * 0.7;
+                        first_block = false;
+                        i = j;
+                        continue;
+                    }
+                }
+
+                // Fenced code-block toggle.
+                if line.starts_with("```") {
+                    in_code = !in_code;
+                    flow.y -= fs * 0.4;
+                    i += 1;
+                    continue;
+                }
+
+                // Horizontal rule.
+                let trimmed = line.trim();
+                if !in_code && (trimmed == "---" || trimmed == "***") {
+                    flow.y -= fs * 0.5;
+                    items.push(rule(left, flow.y, max_x, flow.y, 0.6, 0.65));
+                    flow.y -= fs * 0.5;
+                    i += 1;
+                    continue;
+                }
+
+                // Bullet lines are detected before classification; the
+                // classification itself strips the `- `/`* ` marker.
+                let is_bullet_line =
+                    !in_code && (trimmed.starts_with("- ") || trimmed.starts_with("* "));
+
+                // Classify the block: (content, point-size, force-bold, indent).
+                // `heading_bold` renders the whole line in the bold face.
+                let (block_text, size, heading_bold, indent) = if in_code {
+                    (line.to_string(), fs * 0.9, false, 0.0)
+                } else if let Some(rest) = line.strip_prefix("#### ") {
+                    (rest.to_string(), fs * 1.1, true, 0.0)
+                } else if let Some(rest) = line.strip_prefix("### ") {
+                    (rest.to_string(), fs * 1.25, true, 0.0)
+                } else if let Some(rest) = line.strip_prefix("## ") {
+                    (rest.to_string(), fs * 1.5, true, 0.0)
+                } else if let Some(rest) = line.strip_prefix("# ") {
+                    (rest.to_string(), fs * 2.0, true, 0.0)
+                } else if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+                    let nest = (line.len() - line.trim_start().len()) as f32;
+                    (
+                        rest.to_string(),
+                        fs,
+                        false,
+                        14.0 + nest * fs * 0.22,
+                    )
+                } else if let Some(rest) = line.strip_prefix("> ") {
+                    (rest.to_string(), fs, false, 12.0)
+                } else if trimmed.is_empty() {
+                    // Blank line = paragraph gap.
+                    flow.y -= fs * 0.55;
+                    if flow.y < bottom {
+                        flow.y = start_y;
+                    }
+                    first_block = false;
+                    i += 1;
+                    continue;
+                } else {
+                    (line.to_string(), fs, false, 0.0)
+                };
+
+                let is_heading = heading_bold && !in_code;
+                let is_bullet = is_bullet_line;
+                let lh = if is_heading { size * 1.22 } else { body_lh };
+
+                // Breathing room before headings.
+                if is_heading && !first_block {
+                    flow.y -= size * 0.55;
+                }
+
+                let runs = if in_code {
+                    // Verbatim: hard-wrap long lines at the mono advance
+                    // width; no inline parsing inside code.
+                    let max_chars = ((text_area - indent) / (size * 0.6))
+                        .floor()
+                        .max(10.0) as usize;
+                    let chars: Vec<char> = block_text.chars().collect();
+                    let chunks: Vec<Vec<Seg>> = chars
+                        .chunks(max_chars)
+                        .map(|c| {
+                            vec![(
+                                c.iter().collect::<String>(),
+                                mono_font,
+                                size,
+                            )]
+                        })
+                        .collect();
+                    for chunk in &chunks {
+                        flow.line(lh, start_y, bottom);
+                        items.push(LaidItem::Text(LaidText {
+                            x0: left + indent,
+                            y: flow.y,
+                            text: chunk[0].0.clone(),
+                            font: chunk[0].1,
+                            size: chunk[0].2,
+                            first: true,
+                        }));
+                    }
+                    first_block = false;
+                    i += 1;
+                    continue;
+                } else {
+                    parse_inline_runs(&block_text)
+                };
+
+                let bullet_prefix_w = if is_bullet {
+                    measure("\u{2022} ", body_font, size)
+                } else {
+                    0.0
+                };
+                let x0 = left + indent;
+
+                if is_bullet {
+                    // "• " leads the first line; wrapped continuations hang
+                    // at the text indent, aligned after the bullet.
+                    let mut out: Vec<Vec<Seg>> = Vec::new();
+                    let inner = wrap_runs(
+                        &runs,
+                        heading_bold,
+                        size,
+                        text_area - indent - bullet_prefix_w,
+                        text_area - indent - bullet_prefix_w,
+                        &measure,
+                        font_for_ref,
+                    );
+                    for (li, mut line) in inner.into_iter().enumerate() {
+                        if li == 0 {
+                            line.insert(
+                                0,
+                                ("\u{2022} ".to_string(), body_font, size),
+                            );
+                        }
+                        out.push(line);
+                    }
+                    emit_block(
+                        &mut items,
+                        &mut flow,
+                        out,
+                        x0,
+                        x0 + bullet_prefix_w,
+                        lh,
+                        start_y,
+                        bottom,
+                    );
+                } else {
+                    emit_block(
+                        &mut items,
+                        &mut flow,
+                        wrap_runs(
+                            &runs,
+                            heading_bold,
+                            size,
+                            text_area - indent,
+                            text_area - indent,
+                            &measure,
+                            font_for_ref,
+                        ),
+                        x0,
+                        x0,
+                        lh,
+                        start_y,
+                        bottom,
+                    );
+                }
+
+                if is_heading {
+                    flow.y -= size * 0.18;
+                }
+                first_block = false;
+                i += 1;
+            }
+            items
+        };
+
+        // ------------------------------------------------------------------
+        // Emit. Items arrive in layout order; a run whose baseline rose
+        // above the previous one marks a page break the layout pass
+        // introduced. Successive runs on one line share `y`; `first`
+        // resets the horizontal pen, and each run advances it by its real
+        // measured width so inline style changes stay visually contiguous.
+        // ------------------------------------------------------------------
         {
             let mut page = builder
                 .page(self.config.page_size)
                 .font(body_font, self.config.font_size);
             let mut last_y = f32::MAX;
-            let mut pen_x = self.config.margin_left;
+            let mut pen_x = left;
 
-            for run in runs_out {
-                if run.y > last_y {
+            for item in items {
+                let y = match &item {
+                    LaidItem::Text(t) => t.y,
+                    LaidItem::Rule(r) => r.y0,
+                };
+                if y > last_y {
                     page.done();
                     page = builder
                         .page(self.config.page_size)
                         .font(body_font, self.config.font_size);
                 }
-                if run.first {
-                    pen_x = run.x0;
+                match item {
+                    LaidItem::Text(run) => {
+                        if run.first {
+                            pen_x = run.x0;
+                        }
+                        page = page.font(run.font, run.size);
+                        let width = page.measure(&run.text);
+                        page = page.at(pen_x, run.y).text(&run.text);
+                        pen_x += width;
+                        last_y = run.y;
+                    },
+                    LaidItem::Rule(r) => {
+                        let w = (r.x1 - r.x0).abs().max(0.35);
+                        let h = (r.y0 - r.y1).abs().max(0.35);
+                        page = page.element(ContentElement::Path(PathContent {
+                            bbox: Rect::new(r.x0.min(r.x1), r.y1.min(r.y0), w, h),
+                            operations: vec![
+                                PathOperation::MoveTo(r.x0, r.y0),
+                                PathOperation::LineTo(r.x1, r.y1),
+                            ],
+                            stroke_color: Some(crate::layout::Color {
+                                r: r.gray,
+                                g: r.gray,
+                                b: r.gray,
+                            }),
+                            fill_color: None,
+                            stroke_width: r.width,
+                            line_cap: crate::elements::LineCap::Butt,
+                            line_join: crate::elements::LineJoin::Miter,
+                            dash_pattern: None,
+                            matrix: None,
+                            reading_order: None,
+                            artifact_type: None,
+                            layer: None,
+                        }));
+                        last_y = r.y0;
+                    },
                 }
-                page = page.font(run.font, run.size);
-                let width = page.measure(&run.text);
-                page = page.at(pen_x, run.y).text(&run.text);
-                pen_x += width;
-                last_y = run.y;
             }
             page.done();
         }
