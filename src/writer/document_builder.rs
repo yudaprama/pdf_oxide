@@ -465,6 +465,37 @@ impl<'a> FluentPageBuilder<'a> {
         self
     }
 
+    /// Add a text run in an explicit RGB colour (channels `0.0..=1.0`).
+    ///
+    /// Mirrors [`Self::text`] (same measure + cursor advance) but stamps
+    /// `style.color` instead of the default black. Callers that place every
+    /// run with [`Self::at`] are unaffected by the cursor advance.
+    pub fn text_colored(mut self, r: f32, g: f32, b: f32, text: &str) -> Self {
+        let text_width =
+            self.text_width_of(text, &self.text_config.font, self.text_config.size);
+        let text_rect = Rect::new(self.cursor_x, self.cursor_y, text_width, self.text_config.size);
+        let page = &mut self.builder.pages[self.page_index];
+        page.elements.push(ContentElement::Text(TextContent {
+            text: text.to_string(),
+            bbox: text_rect,
+            font: crate::elements::FontSpec {
+                name: self.text_config.font.clone(),
+                size: self.text_config.size,
+            },
+            style: crate::elements::TextStyle {
+                color: crate::layout::Color { r, g, b },
+                ..Default::default()
+            },
+            reading_order: Some(page.elements.len()),
+            artifact_type: None,
+            origin: None,
+            rotation_degrees: None,
+            matrix: self.current_matrix,
+        }));
+        self.cursor_y -= self.text_config.size * self.text_config.line_height;
+        self
+    }
+
     /// Vertical points remaining on the current page from the cursor down to
     /// the bottom margin (conventionally 72 pt / 1 inch from the bottom of
     /// the page). Pure query — no mutation, no emission.

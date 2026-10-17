@@ -207,6 +207,10 @@ struct InlineRun {
     bold: bool,
     italic: bool,
     code: bool,
+    /// `[text](url)` — text renders in the accent colour, URL dropped.
+    link: bool,
+    /// `~~text~~` — a rule is drawn through the run at emit time.
+    strike: bool,
 }
 
 /// True if `pat` occurs anywhere in `chars[from..]`.
@@ -224,51 +228,366 @@ fn contains_subslice(chars: &[char], from: usize, pat: &[char]) -> bool {
 /// underscores are never touched (underscores are not emphasis markers
 /// here). The markers themselves are consumed; every other character,
 /// spaces included, is preserved, so concatenating the run texts
+/// `1. `/`12)`-style ordered-list marker at the start of a trimmed line:
+/// returns the normalized marker (`"12."`) so the emit path can hang the
+/// wrapped lines after it.
+fn ordered_marker(trimmed: &str) -> Option<String> {
+    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() || digits.len() > 9 {
+        return None;
+    }
+    let rest = &trimmed[digits.len()..];
+    match rest.chars().next() {
+        Some('.') | Some(')') => {},
+        _ => return None,
+    }
+    let after = &rest[1..];
+    if after.is_empty() || !after.starts_with(' ') {
+        return None;
+    }
+    Some(format!("{}.", digits))
+}
+
+/// Syntax-highlight token kind for a fenced code block line.
+#[derive(Clone, Copy, PartialEq)]
+enum CodeKind {
+    Plain,
+    Keyword,
+    Str,
+    Number,
+    Comment,
+}
+
+impl CodeKind {
+    /// Print-friendly colour: muted gray comments, one blue for keywords,
+    /// restrained green/orange for strings/numbers.
+    fn rgb(self) -> (f32, f32, f32) {
+        match self {
+            CodeKind::Plain => (0.10, 0.11, 0.14),
+            CodeKind::Keyword => (0.15, 0.32, 0.70),
+            CodeKind::Str => (0.14, 0.47, 0.24),
+            CodeKind::Number => (0.72, 0.36, 0.08),
+            CodeKind::Comment => (0.48, 0.50, 0.54),
+        }
+    }
+
+    fn bold(self) -> bool {
+        matches!(self, CodeKind::Keyword)
+    }
+}
+
+/// Language family a fenced tag (`sql`, `ts`, `python`, …) belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum CodeLang {
+    Sql,
+    Js,
+    Python,
+    Rust,
+    Go,
+    Shell,
+    Json,
+    CLike,
+    Other,
+}
+
+fn code_lang(tag: &str) -> CodeLang {
+    let t = tag.trim().to_ascii_lowercase();
+    match t.as_str() {
+        "sql" | "postgres" | "postgresql" | "mysql" | "sqlite" => CodeLang::Sql,
+        "js" | "javascript" | "ts" | "typescript" | "jsx" | "tsx" | "node" => CodeLang::Js,
+        "py" | "python" => CodeLang::Python,
+        "rs" | "rust" => CodeLang::Rust,
+        "go" | "golang" => CodeLang::Go,
+        "sh" | "bash" | "shell" | "zsh" | "console" => CodeLang::Shell,
+        "json" | "json5" | "yaml" | "yml" | "toml" => CodeLang::Json,
+        "c" | "cpp" | "c++" | "java" | "cs" | "csharp" | "kotlin" | "swift" | "php" => {
+            CodeLang::CLike
+        },
+        _ => CodeLang::Other,
+    }
+}
+
+fn keyword_set(lang: CodeLang) -> &'static [&'static str] {
+    match lang {
+        CodeLang::Sql => &[
+            "select", "from", "where", "group", "by", "order", "having", "insert", "into",
+            "values", "update", "set", "delete", "create", "table", "alter", "drop", "join",
+            "left", "right", "inner", "outer", "on", "as", "and", "or", "not", "null",
+            "primary", "key", "foreign", "references", "index", "distinct", "limit", "offset",
+            "union", "all", "case", "when", "then", "else", "end", "with", "asc", "desc",
+        ],
+        CodeLang::Js => &[
+            "function", "return", "const", "let", "var", "if", "else", "for", "while", "class",
+            "new", "this", "import", "export", "from", "async", "await", "try", "catch",
+            "throw", "typeof", "instanceof", "null", "undefined", "true", "false", "switch",
+            "case", "break", "continue", "default", "extends", "static", "yield", "delete",
+            "do", "in", "of", "void",
+        ],
+        CodeLang::Python => &[
+            "def", "return", "class", "if", "elif", "else", "for", "while", "import", "from",
+            "as", "with", "try", "except", "finally", "raise", "lambda", "none", "true",
+            "false", "and", "or", "not", "in", "is", "pass", "break", "continue", "global",
+            "nonlocal", "yield", "async", "await", "assert", "del", "self",
+        ],
+        CodeLang::Rust => &[
+            "fn", "let", "mut", "const", "struct", "enum", "impl", "trait", "pub", "use",
+            "mod", "match", "if", "else", "for", "while", "loop", "return", "break",
+            "continue", "self", "self", "crate", "super", "where", "as", "dyn", "ref",
+            "move", "async", "await", "type", "static", "unsafe", "extern", "in", "true",
+            "false",
+        ],
+        CodeLang::Go => &[
+            "func", "var", "const", "type", "struct", "interface", "map", "chan", "go",
+            "defer", "if", "else", "for", "range", "return", "switch", "case", "default",
+            "break", "continue", "package", "import", "select", "fallthrough", "nil", "true",
+            "false",
+        ],
+        CodeLang::Shell => &[
+            "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac",
+            "function", "return", "exit", "export", "local", "echo", "cd", "set", "source",
+        ],
+        CodeLang::Json => &["true", "false", "null"],
+        CodeLang::CLike => &[
+            "int", "char", "float", "double", "void", "bool", "public", "private", "protected",
+            "static", "final", "class", "struct", "enum", "interface", "extends", "implements",
+            "new", "return", "if", "else", "for", "while", "switch", "case", "break",
+            "continue", "default", "try", "catch", "throw", "throws", "import", "package",
+            "true", "false", "null", "this", "super", "const", "using", "namespace", "template",
+            "typename",
+        ],
+        CodeLang::Other => &["true", "false", "null", "nil", "none"],
+    }
+}
+
+/// Split one source line into (text, kind) tokens. `in_block` tracks a
+/// `/* … */` comment across lines; the caller carries it between lines of
+/// the same code block. `lang` decides comment markers and keywords.
+fn tokenize_code_line(line: &str, lang: CodeLang, in_block: &mut bool) -> Vec<(String, CodeKind)> {
+    let mut out: Vec<(String, CodeKind)> = Vec::new();
+    let mut push = |text: String, kind: CodeKind| {
+        if !text.is_empty() {
+            if let Some((last_text, last_kind)) = out.last_mut() {
+                if *last_kind == kind {
+                    last_text.push_str(&text);
+                    return;
+                }
+            }
+            out.push((text, kind));
+        }
+    };
+
+    let chars: Vec<char> = line.chars().collect();
+    let mut plain = String::new();
+    let word_start = |chars: &[char], i: usize| i == 0 || chars[i - 1].is_whitespace();
+
+    let mut i = 0;
+    while i < chars.len() {
+        if *in_block {
+            // Inside /* … */: everything until `*/` is comment.
+            let rest: String = chars[i..].iter().collect();
+            match rest.find("*/") {
+                Some(end) => {
+                    push(rest[..end + 2].to_string(), CodeKind::Comment);
+                    *in_block = false;
+                    i += end + 2;
+                },
+                None => {
+                    push(rest, CodeKind::Comment);
+                    i = chars.len();
+                },
+            }
+            continue;
+        }
+
+        let c = chars[i];
+
+        // Line comments (word-start anchored so `a--b` in SQL stays plain).
+        let line_marker: Option<&str> = if word_start(&chars, i) {
+            match lang {
+                CodeLang::Sql => Some("--"),
+                CodeLang::Shell | CodeLang::Python => Some("#"),
+                CodeLang::Js | CodeLang::Rust | CodeLang::Go | CodeLang::CLike => Some("//"),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(marker) = line_marker {
+            let rest: String = chars[i..].iter().collect();
+            if rest.starts_with(marker) {
+                push(plain.drain(..).collect(), CodeKind::Plain);
+                push(rest, CodeKind::Comment);
+                break;
+            }
+        }
+
+        // Block comment start.
+        if c == '/' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            push(plain.drain(..).collect(), CodeKind::Plain);
+            push("/*".to_string(), CodeKind::Comment);
+            *in_block = true;
+            i += 2;
+            continue;
+        }
+
+        // Strings: scan to the closing quote (backslash escapes); an
+        // unterminated string takes the rest of the line.
+        if c == '"' || c == '\'' {
+            push(plain.drain(..).collect(), CodeKind::Plain);
+            let mut j = i + 1;
+            while j < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == c {
+                    j += 1;
+                    break;
+                }
+                j += 1;
+            }
+            push(chars[i..j.min(chars.len())].iter().collect(), CodeKind::Str);
+            i = j.min(chars.len());
+            continue;
+        }
+
+        // Numbers: decimal / hex-ish run.
+        if c.is_ascii_digit() {
+            push(plain.drain(..).collect(), CodeKind::Plain);
+            let mut j = i;
+            while j < chars.len()
+                && (chars[j].is_ascii_alphanumeric() || chars[j] == '.' || chars[j] == '_')
+            {
+                j += 1;
+            }
+            push(chars[i..j].iter().collect(), CodeKind::Number);
+            i = j;
+            continue;
+        }
+
+        // Words: keywords (case-insensitive).
+        if c.is_alphabetic() || c == '_' {
+            let mut j = i;
+            while j < chars.len() && (chars[j].is_alphanumeric() || chars[j] == '_') {
+                j += 1;
+            }
+            let word: String = chars[i..j].iter().collect();
+            push(plain.drain(..).collect(), CodeKind::Plain);
+            let is_kw = keyword_set(lang).contains(&word.to_ascii_lowercase().as_str());
+            push(word, if is_kw { CodeKind::Keyword } else { CodeKind::Plain });
+            i = j;
+            continue;
+        }
+
+        plain.push(c);
+        i += 1;
+    }
+    push(plain, CodeKind::Plain);
+    out
+}
+
 /// reproduces the visible line.
 fn parse_inline_runs(s: &str) -> Vec<InlineRun> {
-    fn flush(runs: &mut Vec<InlineRun>, buf: &mut String, bold: bool, italic: bool, code: bool) {
+    fn flush(
+        runs: &mut Vec<InlineRun>,
+        buf: &mut String,
+        bold: bool,
+        italic: bool,
+        code: bool,
+        strike: bool,
+    ) {
         if !buf.is_empty() {
             runs.push(InlineRun {
                 text: std::mem::take(buf),
                 bold,
                 italic,
                 code,
+                link: false,
+                strike,
             });
         }
+    }
+
+    // `[text](url)` starting at `open`: returns `(index_of_], index_after_)`
+    // when a well-formed target follows, else `None`. The URL is not
+    // nested — scanned to the first `)`.
+    fn link_target(chars: &[char], open: usize) -> Option<(usize, usize)> {
+        let mut j = open + 1;
+        while j < chars.len() {
+            if chars[j] == '[' {
+                return None; // nested `[` — treat the outer one as literal
+            }
+            if chars[j] == ']' {
+                break;
+            }
+            j += 1;
+        }
+        if j + 1 >= chars.len() || chars[j + 1] != '(' {
+            return None;
+        }
+        let mut k = j + 2;
+        while k < chars.len() && chars[k] != ')' {
+            k += 1;
+        }
+        if k >= chars.len() || k == j + 2 {
+            return None; // no closing paren, or empty target
+        }
+        Some((j, k))
     }
 
     let chars: Vec<char> = s.chars().collect();
     let mut runs: Vec<InlineRun> = Vec::new();
     let mut buf = String::new();
-    let (mut bold, mut italic, mut code) = (false, false, false);
+    let (mut bold, mut italic, mut code, mut strike) = (false, false, false, false);
     let mut i = 0;
 
     while i < chars.len() {
         let c = chars[i];
         if c == '`' {
             if code {
-                flush(&mut runs, &mut buf, bold, italic, code);
+                flush(&mut runs, &mut buf, bold, italic, code, strike);
                 code = false;
                 i += 1;
                 continue;
             }
             if contains_subslice(&chars, i + 1, &['`']) {
-                flush(&mut runs, &mut buf, bold, italic, code);
+                flush(&mut runs, &mut buf, bold, italic, code, strike);
                 code = true;
                 i += 1;
                 continue;
+            }
+        } else if c == '[' && !code {
+            if let Some((close, url_end)) = link_target(&chars, i) {
+                flush(&mut runs, &mut buf, bold, italic, code, strike);
+                let inner: String = chars[i + 1..close].iter().collect();
+                for mut r in parse_inline_runs(&inner) {
+                    r.link = true;
+                    runs.push(r);
+                }
+                i = url_end + 1;
+                continue;
+            }
+        } else if c == '~' && !code {
+            let dbl = i + 1 < chars.len() && chars[i + 1] == '~';
+            if dbl {
+                if strike || contains_subslice(&chars, i + 2, &['~', '~']) {
+                    flush(&mut runs, &mut buf, bold, italic, code, strike);
+                    strike = !strike;
+                    i += 2;
+                    continue;
+                }
             }
         } else if c == '*' && !code {
             let dbl = i + 1 < chars.len() && chars[i + 1] == '*';
             if dbl {
                 if bold || contains_subslice(&chars, i + 2, &['*', '*']) {
-                    flush(&mut runs, &mut buf, bold, italic, code);
+                    flush(&mut runs, &mut buf, bold, italic, code, strike);
                     bold = !bold;
                     i += 2;
                     continue;
                 }
             } else if italic || contains_subslice(&chars, i + 1, &['*']) {
-                flush(&mut runs, &mut buf, bold, italic, code);
+                flush(&mut runs, &mut buf, bold, italic, code, strike);
                 italic = !italic;
                 i += 1;
                 continue;
@@ -277,7 +596,7 @@ fn parse_inline_runs(s: &str) -> Vec<InlineRun> {
         buf.push(c);
         i += 1;
     }
-    flush(&mut runs, &mut buf, bold, italic, code);
+    flush(&mut runs, &mut buf, bold, italic, code, strike);
     runs
 }
 
@@ -3359,8 +3678,18 @@ impl PdfBuilder {
         // tables. Without the embedded branch, DejaVu text measures as
         // Helvetica and bold/regular run transitions overlap.
 
-        /// One positioned text run (absolute baseline) or a stroked rule,
-        /// ready for the emit pass.
+        /// One positioned text run (absolute baseline), a stroked rule,
+        /// or a filled panel behind content — ready for the emit pass.
+        type Rgb = (f32, f32, f32);
+        /// Print-friendly palette: near-black headings, one muted accent,
+        /// light fills that survive both screen and paper.
+        const HEADING_RGB: Rgb = (0.11, 0.15, 0.22);
+        const ACCENT_RGB: Rgb = (0.20, 0.44, 0.82);
+        const QUOTE_TEXT_RGB: Rgb = (0.36, 0.40, 0.47);
+        const QUOTE_BAR_RGB: Rgb = (0.64, 0.70, 0.80);
+        const PANEL_RGB: Rgb = (0.956, 0.957, 0.965);
+        const THEAD_RGB: Rgb = (0.933, 0.937, 0.945);
+        const ZEBRA_RGB: Rgb = (0.972, 0.974, 0.978);
         struct LaidText {
             x0: f32,
             y: f32,
@@ -3368,6 +3697,11 @@ impl PdfBuilder {
             font: &'static str,
             size: f32,
             first: bool,
+            rgb: Rgb,
+            /// Inline code run: draw a light chip behind it.
+            chip: bool,
+            /// `~~strike~~`: draw a rule through this run.
+            strike: bool,
         }
         struct LaidRule {
             x0: f32,
@@ -3375,13 +3709,33 @@ impl PdfBuilder {
             x1: f32,
             y1: f32,
             width: f32,
-            gray: f32,
+            /// Colour; gray rules via [`rule`], accent for check marks.
+            rgb: Rgb,
+        }
+        struct LaidRect {
+            x0: f32,
+            y0: f32,
+            x1: f32,
+            y1: f32,
+            rgb: Rgb,
+            /// Stroked outline (checkbox) instead of a filled panel.
+            stroke: bool,
         }
         enum LaidItem {
             Text(LaidText),
             Rule(LaidRule),
+            Rect(LaidRect),
         }
-        type Seg = (String, &'static str, f32);
+        /// One styled word-run on a laid-out line.
+        struct Seg {
+            text: String,
+            font: &'static str,
+            size: f32,
+            rgb: Rgb,
+            chip: bool,
+            /// `~~strike~~`: emit draws a rule through the run.
+            strike: bool,
+        }
 
         let items: Vec<LaidItem> = {
             let measure = |text: &str, font: &str, size: f32| -> f32 {
@@ -3415,19 +3769,34 @@ impl PdfBuilder {
                     x1,
                     y1,
                     width,
-                    gray,
+                    rgb: (gray, gray, gray),
+                })
+            }
+
+            /// A rule in an explicit colour (task-list check marks).
+            fn rule_rgb(x0: f32, y0: f32, x1: f32, y1: f32, width: f32, rgb: Rgb) -> LaidItem {
+                LaidItem::Rule(LaidRule {
+                    x0,
+                    y0,
+                    x1,
+                    y1,
+                    width,
+                    rgb,
                 })
             }
 
             /// Greedy word wrap across styled runs. Spaces are appended to
             /// the preceding segment's text so the emit pass's per-segment
             /// measure reproduces exact inter-word and inter-style gaps.
+            #[allow(clippy::too_many_arguments)]
             fn wrap_runs(
                 runs: &[InlineRun],
                 heading_bold: bool,
                 size: f32,
                 width_first: f32,
                 width_rest: f32,
+                rgb: Rgb,
+                allow_chip: bool,
                 measure: &dyn Fn(&str, &str, f32) -> f32,
                 font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
             ) -> Vec<Vec<Seg>> {
@@ -3437,6 +3806,7 @@ impl PdfBuilder {
                 let mut avail = width_first;
                 for run in runs {
                     let font = font_for(run, heading_bold);
+                    let run_rgb = if run.link { ACCENT_RGB } else { rgb };
                     for word in run.text.split_whitespace() {
                         // Punctuation-only tokens — the `,` of
                         // `**bold**, regular` arrives as its own token from
@@ -3452,13 +3822,14 @@ impl PdfBuilder {
                                 )
                             })
                         {
-                            cur.last_mut().unwrap().0.push_str(word);
-                            cur_w += measure(word, font, size);
+                            let last = cur.last_mut().unwrap();
+                            last.text.push_str(word);
+                            cur_w += measure(word, last.font, last.size);
                             continue;
                         }
                         let ww = measure(word, font, size);
                         let sp_w = match cur.last() {
-                            Some(last) => measure(" ", last.1, last.2),
+                            Some(last) => measure(" ", last.font, last.size),
                             None => 0.0,
                         };
                         if !cur.is_empty() && cur_w + sp_w + ww > avail {
@@ -3467,19 +3838,38 @@ impl PdfBuilder {
                             avail = width_rest;
                         }
                         match cur.last_mut() {
-                            Some(last) if last.1 == font && (last.2 - size).abs() < f32::EPSILON => {
-                                last.0.push(' ');
-                                last.0.push_str(word);
+                            Some(last)
+                                if last.font == font
+                                    && (last.size - size).abs() < f32::EPSILON
+                                    && last.chip == (allow_chip && run.code)
+                                    && last.strike == run.strike =>
+                            {
+                                last.text.push(' ');
+                                last.text.push_str(word);
                                 cur_w += sp_w + ww;
                             },
                             Some(last) => {
-                                last.0.push(' ');
+                                last.text.push(' ');
                                 cur_w += sp_w;
-                                cur.push((word.to_string(), font, size));
+                                cur.push(Seg {
+                                    text: word.to_string(),
+                                    font,
+                                    size,
+                                    rgb: run_rgb,
+                                    chip: allow_chip && run.code,
+                                    strike: run.strike,
+                                });
                                 cur_w += ww;
                             },
                             None => {
-                                cur.push((word.to_string(), font, size));
+                                cur.push(Seg {
+                                    text: word.to_string(),
+                                    font,
+                                    size,
+                                    rgb: run_rgb,
+                                    chip: allow_chip && run.code,
+                                    strike: run.strike,
+                                });
                                 cur_w = ww;
                             },
                         }
@@ -3534,12 +3924,15 @@ impl PdfBuilder {
                 font_for: &dyn Fn(&InlineRun, bool) -> &'static str,
             ) -> usize {
                 let runs = parse_inline_runs(cell);
-                wrap_runs(&runs, false, size, width, width, measure, font_for)
+                wrap_runs(&runs, false, size, width, width, (0.0, 0.0, 0.0), false, measure, font_for)
                     .len()
                     .max(1)
             }
 
             /// Place one wrapped block of styled runs under `flow`.
+            /// `bar` = optional accent bar at the left edge of the first
+            /// column (blockquote): `(x, width, colour)` — tiled per line
+            /// so page breaks never strand a bar.
             #[allow(clippy::too_many_arguments)]
             fn emit_block(
                 items: &mut Vec<LaidItem>,
@@ -3550,19 +3943,73 @@ impl PdfBuilder {
                 lh: f32,
                 start_y: f32,
                 bottom: f32,
+                bar: Option<(f32, f32, Rgb)>,
+                task: Option<(f32, f32, bool)>,
             ) {
                 for (li, line) in lines.iter().enumerate() {
                     flow.line(lh, start_y, bottom);
                     let x = if li == 0 { x0 } else { cont_x0 };
+                    if li == 0 {
+                        if let Some((bx, bw, checked)) = task {
+                            // Font-independent checkbox: stroked square,
+                            // accent check mark when `[x]`.
+                            let bh = lh * 0.50;
+                            let by = flow.y + lh * 0.10;
+                            items.push(LaidItem::Rect(LaidRect {
+                                x0: bx,
+                                y0: by + bh,
+                                x1: bx + bw,
+                                y1: by,
+                                rgb: (0.0, 0.0, 0.0),
+                                stroke: true,
+                            }));
+                            if checked {
+                                let cy = by + bh * 0.5;
+                                items.push(rule_rgb(
+                                    bx + bw * 0.18,
+                                    cy + 0.4,
+                                    bx + bw * 0.42,
+                                    cy - 2.4,
+                                    1.3,
+                                    ACCENT_RGB,
+                                ));
+                                items.push(rule_rgb(
+                                    bx + bw * 0.42,
+                                    cy - 2.4,
+                                    bx + bw * 0.85,
+                                    cy + bh * 0.30,
+                                    1.3,
+                                    ACCENT_RGB,
+                                ));
+                            }
+                        }
+                    }
+                    if let Some((bx, bw, brgb)) = bar {
+                        // Tile the bar per line: height = line height keeps
+                        // consecutive tiles contiguous, and a tile belongs
+                        // to whichever page its line landed on.
+                        let top = flow.y + lh * 0.30;
+                        items.push(LaidItem::Rect(LaidRect {
+                            x0: bx,
+                            y0: top,
+                            x1: bx + bw,
+                            y1: top - lh,
+                            rgb: brgb,
+                            stroke: false,
+                        }));
+                    }
                     let mut first = true;
-                    for (text, font, size) in line {
+                    for seg in line {
                         items.push(LaidItem::Text(LaidText {
                             x0: x,
                             y: flow.y,
-                            text: text.clone(),
-                            font,
-                            size: *size,
+                            text: seg.text.clone(),
+                            font: seg.font,
+                            size: seg.size,
                             first,
+                            rgb: seg.rgb,
+                            chip: seg.chip,
+                            strike: seg.strike,
                         }));
                         first = false;
                     }
@@ -3570,8 +4017,11 @@ impl PdfBuilder {
             }
 
             /// Draw one table row at the flow cursor. `bold` styles the
-            /// whole row (header). Returns the row's top y.
+            /// whole row (header). `fill` paints a panel behind the row
+            /// (header tint / zebra stripe) under the grid lines.
+            /// Returns the row's top y.
             #[allow(clippy::too_many_arguments)]
+            #[allow(clippy::type_complexity)]
             fn draw_row(
                 items: &mut Vec<LaidItem>,
                 flow: &mut Flow,
@@ -3579,6 +4029,7 @@ impl PdfBuilder {
                 widths: &[f32],
                 aligns: &[GfmAlign],
                 bold: bool,
+                fill: Option<Rgb>,
                 left: f32,
                 pad_x: f32,
                 pad_y: f32,
@@ -3595,7 +4046,17 @@ impl PdfBuilder {
                 for ci in 0..ncols {
                     let cell = cells.get(ci).map(String::as_str).unwrap_or("");
                     let runs = parse_inline_runs(cell);
-                    let lines = wrap_runs(&runs, bold, fs, widths[ci], widths[ci], measure, font_for);
+                    let lines = wrap_runs(
+                        &runs,
+                        bold,
+                        fs,
+                        widths[ci],
+                        widths[ci],
+                        if bold { HEADING_RGB } else { (0.0, 0.0, 0.0) },
+                        false,
+                        measure,
+                        font_for,
+                    );
                     max_lines = max_lines.max(lines.len().max(1));
                     wrapped.push(lines);
                 }
@@ -3605,6 +4066,18 @@ impl PdfBuilder {
                     flow.y = start_y - h;
                 }
                 let row_top = flow.y + h;
+
+                // Row panel first: grid lines and text render above it.
+                if let Some(rgb) = fill {
+                    items.push(LaidItem::Rect(LaidRect {
+                        x0: left,
+                        y0: row_top,
+                        x1: left + widths.iter().sum::<f32>() + 2.0 * pad_x * ncols as f32,
+                        y1: row_top - h,
+                        rgb,
+                        stroke: false,
+                    }));
+                }
 
                 // Vertical separators, drawn per row so page breaks never
                 // strand a line.
@@ -3621,7 +4094,7 @@ impl PdfBuilder {
                         left + widths[..ci].iter().sum::<f32>() + 2.0 * pad_x * ci as f32 + pad_x;
                     for (li, line) in lines.iter().enumerate() {
                         let line_w: f32 =
-                            line.iter().map(|(t, f, s)| measure(t, f, *s)).sum();
+                            line.iter().map(|s| measure(&s.text, s.font, s.size)).sum();
                         let y = row_top - pad_y - (li as f32 + 0.82) * cell_lh;
                         let x = match aligns.get(ci).copied().unwrap_or(GfmAlign::Left) {
                             GfmAlign::Right => x_cell + widths[ci] - line_w,
@@ -3629,14 +4102,17 @@ impl PdfBuilder {
                             GfmAlign::Left => x_cell,
                         };
                         let mut first = true;
-                        for (text, font, size) in line {
+                        for seg in line {
                             items.push(LaidItem::Text(LaidText {
                                 x0: x,
                                 y,
-                                text: text.clone(),
-                                font,
-                                size: *size,
+                                text: seg.text.clone(),
+                                font: seg.font,
+                                size: seg.size,
                                 first,
+                                rgb: seg.rgb,
+                                chip: false,
+                                strike: seg.strike,
                             }));
                             first = false;
                         }
@@ -3648,10 +4124,92 @@ impl PdfBuilder {
             // ---- block flow ----
             let fs = self.config.font_size;
             let body_lh = fs * self.config.line_height;
-            let mut flow = Flow { y: start_y };
             let mut items: Vec<LaidItem> = Vec::new();
+
+            // ---- Cover title block ----
+            // Opt-in via title metadata; skipped when the document opens
+            // with its own `# ` H1 (a cover above that would duplicate the
+            // title). Content starts below the block.
+            let mut content_start_y = start_y;
+            {
+                let has_own_h1 = content
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .map(|l| l.trim_start().starts_with("# "))
+                    .unwrap_or(false);
+                if let (false, Some(cover_title)) = (has_own_h1, self.config.title.as_deref()) {
+                    if !cover_title.trim().is_empty() {
+                        let mut y = start_y;
+                        let t_size = fs * 2.2;
+                        let t_lh = t_size * 1.18;
+                        let t_runs = parse_inline_runs(cover_title);
+                        for line in wrap_runs(
+                            &t_runs,
+                            true,
+                            t_size,
+                            text_area,
+                            text_area,
+                            HEADING_RGB,
+                            false,
+                            &measure,
+                            font_for_ref,
+                        ) {
+                            y -= t_lh;
+                            let mut first = true;
+                            for seg in &line {
+                                items.push(LaidItem::Text(LaidText {
+                                    x0: left,
+                                    y,
+                                    text: seg.text.clone(),
+                                    font: seg.font,
+                                    size: seg.size,
+                                    first,
+                                    rgb: seg.rgb,
+                                    chip: false,
+                                    strike: false,
+                                }));
+                                first = false;
+                            }
+                        }
+                        y -= t_size * 0.45;
+                        let mut meta = chrono::Local::now().format("%Y-%m-%d").to_string();
+                        if let Some(author) = &self.config.author {
+                            if !author.trim().is_empty() {
+                                meta = format!("{}  \u{b7}  {}", author, meta);
+                            }
+                        }
+                        y -= fs * 1.4;
+                        items.push(LaidItem::Text(LaidText {
+                            x0: left,
+                            y,
+                            text: meta,
+                            font: body_font,
+                            size: fs * 0.85,
+                            first: true,
+                            rgb: QUOTE_TEXT_RGB,
+                            chip: false,
+                            strike: false,
+                        }));
+                        y -= fs * 1.1;
+                        items.push(LaidItem::Rect(LaidRect {
+                            x0: left,
+                            y0: y + 1.1,
+                            x1: (left + 140.0).min(max_x),
+                            y1: y - 1.1,
+                            rgb: ACCENT_RGB,
+                            stroke: false,
+                        }));
+                        content_start_y = y - fs * 2.0;
+                    }
+                }
+            }
+
+            let mut flow = Flow { y: content_start_y };
             let mut in_code = false;
             let mut first_block = true;
+            let mono_bold = "Courier-Bold";
+            let mut code_lang_tag = CodeLang::Other;
+            let mut in_block_comment = false;
 
             let lines: Vec<&str> = content.lines().collect();
             let mut i = 0;
@@ -3724,7 +4282,11 @@ impl PdfBuilder {
                         }
 
                         // Gap above the table, then the bordered header.
+                        // Rules span the table grid, not the full text
+                        // area — fills and borders must box the same box.
                         flow.y -= cell_fs * 0.7;
+                        let table_right =
+                            left + widths.iter().sum::<f32>() + 2.0 * pad_x * ncols as f32;
                         let draw_header = |items: &mut Vec<LaidItem>, flow: &mut Flow| {
                             // Top border first: items must stay in
                             // descending-y order or the emit pass reads the
@@ -3732,21 +4294,22 @@ impl PdfBuilder {
                             items.push(rule(
                                 left,
                                 flow.y,
-                                max_x,
+                                table_right,
                                 flow.y,
                                 0.75,
                                 0.35,
                             ));
                             draw_row(
                                 items, flow, &table.headers, &widths, &table.alignments, true,
+                                Some(THEAD_RGB),
                                 left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
                                 &measure, font_for_ref,
                             );
-                            items.push(rule(left, flow.y, max_x, flow.y, 0.6, 0.55));
+                            items.push(rule(left, flow.y, table_right, flow.y, 0.6, 0.55));
                         };
                         draw_header(&mut items, &mut flow);
 
-                        for row in &table.rows {
+                        for (ri, row) in table.rows.iter().enumerate() {
                             // Repeat the header on a fresh page when the
                             // next row cannot fit whole.
                             let need = row
@@ -3772,12 +4335,13 @@ impl PdfBuilder {
                             }
                             draw_row(
                                 &mut items, &mut flow, row, &widths, &table.alignments, false,
+                                if ri % 2 == 1 { Some(ZEBRA_RGB) } else { None },
                                 left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
                                 &measure, font_for_ref,
                             );
-                            items.push(rule(left, flow.y, max_x, flow.y, 0.35, 0.82));
+                            items.push(rule(left, flow.y, table_right, flow.y, 0.35, 0.82));
                         }
-                        items.push(rule(left, flow.y, max_x, flow.y, 0.75, 0.35));
+                        items.push(rule(left, flow.y, table_right, flow.y, 0.75, 0.35));
                         flow.y -= cell_fs * 0.7;
                         first_block = false;
                         i = j;
@@ -3785,9 +4349,16 @@ impl PdfBuilder {
                     }
                 }
 
-                // Fenced code-block toggle.
+                // Fenced code-block toggle. The opening fence may carry a
+                // language tag driving the syntax highlighter.
                 if line.starts_with("```") {
-                    in_code = !in_code;
+                    if in_code {
+                        in_code = false;
+                    } else {
+                        in_code = true;
+                        code_lang_tag = code_lang(line.get(3..).unwrap_or(""));
+                        in_block_comment = false;
+                    }
                     flow.y -= fs * 0.4;
                     i += 1;
                     continue;
@@ -3804,9 +4375,12 @@ impl PdfBuilder {
                 }
 
                 // Bullet lines are detected before classification; the
-                // classification itself strips the `- `/`* ` marker.
+                // classification itself strips the `- `/`* ` marker (and
+                // the GFM task prefix, feeding `task_checked`).
                 let is_bullet_line =
                     !in_code && (trimmed.starts_with("- ") || trimmed.starts_with("* "));
+                let mut ordered_list_marker: Option<String> = None;
+                let mut task_checked: Option<bool> = None;
 
                 // Classify the block: (content, point-size, force-bold, indent).
                 // `heading_bold` renders the whole line in the bold face.
@@ -3822,12 +4396,30 @@ impl PdfBuilder {
                     (rest.to_string(), fs * 2.0, true, 0.0)
                 } else if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
                     let nest = (line.len() - line.trim_start().len()) as f32;
+                    // GFM task list: `- [ ] `/`- [x] ` renders a drawn
+                    // checkbox instead of the bullet glyph.
+                    let (rest2, checked) = if let Some(r) = rest.strip_prefix("[ ] ") {
+                        (r, Some(false))
+                    } else if let Some(r) =
+                        rest.strip_prefix("[x] ").or_else(|| rest.strip_prefix("[X] "))
+                    {
+                        (r, Some(true))
+                    } else {
+                        (rest, None)
+                    };
+                    task_checked = checked;
                     (
-                        rest.to_string(),
+                        rest2.to_string(),
                         fs,
                         false,
                         14.0 + nest * fs * 0.22,
                     )
+                } else if !in_code && ordered_marker(trimmed).is_some() {
+                    let marker = ordered_marker(trimmed).expect("checked above");
+                    ordered_list_marker = Some(marker.clone());
+                    let nest = (line.len() - line.trim_start().len()) as f32;
+                    // marker + the single separator space
+                    (trimmed[marker.len() + 1..].to_string(), fs, false, 14.0 + nest * fs * 0.22)
                 } else if let Some(rest) = line.strip_prefix("> ") {
                     (rest.to_string(), fs, false, 12.0)
                 } else if trimmed.is_empty() {
@@ -3853,32 +4445,74 @@ impl PdfBuilder {
                 }
 
                 let runs = if in_code {
-                    // Verbatim: hard-wrap long lines at the mono advance
-                    // width; no inline parsing inside code.
-                    let max_chars = ((text_area - indent) / (size * 0.6))
-                        .floor()
-                        .max(10.0) as usize;
-                    let chars: Vec<char> = block_text.chars().collect();
-                    let chunks: Vec<Vec<Seg>> = chars
-                        .chunks(max_chars)
-                        .map(|c| {
-                            vec![(
-                                c.iter().collect::<String>(),
-                                mono_font,
-                                size,
-                            )]
-                        })
-                        .collect();
+                    // Verbatim: syntax-highlighted (tokenizer above), then
+                    // hard-wrapped at the mono advance width — chunking on
+                    // token boundaries so colour runs survive the wrap.
+                    // Each rendered line gets a full-width panel tile
+                    // (height = line height, so tiles stay contiguous and
+                    // page-break safe); a blank source line still emits its
+                    // tile.
+                    let mono_w = measure("0", mono_font, size).max(0.1);
+                    let max_chars = ((text_area - indent) / mono_w).floor().max(10.0) as usize;
+                    let tokens =
+                        tokenize_code_line(&block_text, code_lang_tag, &mut in_block_comment);
+                    let mut chunks: Vec<Vec<Seg>> = vec![Vec::new()];
+                    let mut used = 0usize;
+                    for (text, kind) in tokens {
+                        let font = if kind.bold() { mono_bold } else { mono_font };
+                        let rgb = kind.rgb();
+                        let mut rest: Vec<char> = text.chars().collect();
+                        while !rest.is_empty() {
+                            let take = (max_chars - used).max(1).min(rest.len());
+                            let piece: String = rest[..take].iter().collect();
+                            chunks
+                                .last_mut()
+                                .expect("seeded")
+                                .push(Seg {
+                                    text: piece,
+                                    font,
+                                    size,
+                                    rgb,
+                                    chip: false,
+                                    strike: false,
+                                });
+                            used += take;
+                            rest.drain(..take);
+                            if used >= max_chars {
+                                chunks.push(Vec::new());
+                                used = 0;
+                            }
+                        }
+                    }
+                    if chunks.len() > 1 && chunks.last().expect("seeded").is_empty() {
+                        chunks.pop();
+                    }
                     for chunk in &chunks {
                         flow.line(lh, start_y, bottom);
-                        items.push(LaidItem::Text(LaidText {
-                            x0: left + indent,
-                            y: flow.y,
-                            text: chunk[0].0.clone(),
-                            font: chunk[0].1,
-                            size: chunk[0].2,
-                            first: true,
+                        let top = flow.y + lh * 0.80;
+                        items.push(LaidItem::Rect(LaidRect {
+                            x0: left - 4.0,
+                            y0: top,
+                            x1: max_x + 4.0,
+                            y1: top - lh,
+                            rgb: PANEL_RGB,
+                            stroke: false,
                         }));
+                        let mut first = true;
+                        for seg in chunk {
+                            items.push(LaidItem::Text(LaidText {
+                                x0: left + indent,
+                                y: flow.y,
+                                text: seg.text.clone(),
+                                font: seg.font,
+                                size: seg.size,
+                                first,
+                                rgb: seg.rgb,
+                                chip: false,
+                                strike: false,
+                            }));
+                            first = false;
+                        }
                     }
                     first_block = false;
                     i += 1;
@@ -3887,46 +4521,112 @@ impl PdfBuilder {
                     parse_inline_runs(&block_text)
                 };
 
+                let is_quote = !in_code && trimmed.starts_with("> ");
+
+                let is_ordered = ordered_list_marker.is_some();
+                let is_list = is_bullet || is_ordered || task_checked.is_some();
+                let list_prefix: Option<String> = if is_bullet && task_checked.is_none() {
+                    Some("\u{2022} ".to_string())
+                } else {
+                    ordered_list_marker.as_ref().map(|m| format!("{} ", m))
+                };
                 let bullet_prefix_w = if is_bullet {
                     measure("\u{2022} ", body_font, size)
+                } else if is_ordered {
+                    measure(
+                        &format!("{} ", ordered_list_marker.as_ref().expect("checked")),
+                        body_font,
+                        size,
+                    )
+                } else if task_checked.is_some() {
+                    12.0 // checkbox + gap
                 } else {
                     0.0
                 };
                 let x0 = left + indent;
 
-                if is_bullet {
-                    // "• " leads the first line; wrapped continuations hang
-                    // at the text indent, aligned after the bullet.
-                    let mut out: Vec<Vec<Seg>> = Vec::new();
-                    let inner = wrap_runs(
+                // Block colour: headings near-black, quotes muted gray,
+                // everything else plain black.
+                let block_rgb = if is_heading {
+                    HEADING_RGB
+                } else if is_quote {
+                    QUOTE_TEXT_RGB
+                } else {
+                    (0.0, 0.0, 0.0)
+                };
+
+                // Keep-with-next: a heading stranded at the bottom of a
+                // page (its content on the next) reads as a misprint.
+                // Reserve room for the heading block plus two lines of
+                // whatever follows; if that does not fit below the cursor,
+                // restart at the top of the next page (the emit pass reads
+                // the y rise as the page break).
+                let mut heading_lines: Option<Vec<Vec<Seg>>> = None;
+                if is_heading {
+                    let lines = wrap_runs(
+                        &runs,
+                        heading_bold,
+                        size,
+                        text_area - indent,
+                        text_area - indent,
+                        block_rgb,
+                        true,
+                        &measure,
+                        font_for_ref,
+                    );
+                    let needed = lines.len() as f32 * lh + size * 0.18 + 2.0 * body_lh;
+                    if flow.y - needed < bottom {
+                        flow.y = start_y;
+                    }
+                    heading_lines = Some(lines);
+                }
+
+                if is_list {
+                    // The marker ("• ", "3. ") leads the first line; a task
+                    // item draws a checkbox instead. Wrapped continuations
+                    // hang at the marker width.
+                    let mut out = wrap_runs(
                         &runs,
                         heading_bold,
                         size,
                         text_area - indent - bullet_prefix_w,
                         text_area - indent - bullet_prefix_w,
+                        block_rgb,
+                        true,
                         &measure,
                         font_for_ref,
                     );
-                    for (li, mut line) in inner.into_iter().enumerate() {
-                        if li == 0 {
-                            line.insert(
+                    if let Some(pref) = &list_prefix {
+                        if let Some(first) = out.first_mut() {
+                            first.insert(
                                 0,
-                                ("\u{2022} ".to_string(), body_font, size),
+                                Seg {
+                                    text: pref.clone(),
+                                    font: body_font,
+                                    size,
+                                    rgb: block_rgb,
+                                    chip: false,
+                                    strike: false,
+                                },
                             );
                         }
-                        out.push(line);
                     }
+                    let task = task_checked.map(|checked| (x0, 8.0, checked));
+                    let first_x = if task.is_some() { x0 + 12.0 } else { x0 };
                     emit_block(
                         &mut items,
                         &mut flow,
                         out,
-                        x0,
+                        first_x,
                         x0 + bullet_prefix_w,
                         lh,
                         start_y,
                         bottom,
+                        None,
+                        task,
                     );
-                } else {
+                } else if is_quote {
+                    // Accent bar down the left edge + muted text.
                     emit_block(
                         &mut items,
                         &mut flow,
@@ -3936,6 +4636,8 @@ impl PdfBuilder {
                             size,
                             text_area - indent,
                             text_area - indent,
+                            block_rgb,
+                            true,
                             &measure,
                             font_for_ref,
                         ),
@@ -3944,11 +4646,52 @@ impl PdfBuilder {
                         lh,
                         start_y,
                         bottom,
+                        Some((left, 2.5, QUOTE_BAR_RGB)),
+                        None,
+                    );
+                } else {
+                    let lines = heading_lines.take().unwrap_or_else(|| {
+                        wrap_runs(
+                            &runs,
+                            heading_bold,
+                            size,
+                            text_area - indent,
+                            text_area - indent,
+                            block_rgb,
+                            true,
+                            &measure,
+                            font_for_ref,
+                        )
+                    });
+                    emit_block(
+                        &mut items,
+                        &mut flow,
+                        lines,
+                        x0,
+                        x0,
+                        lh,
+                        start_y,
+                        bottom,
+                        None,
+                        None,
                     );
                 }
 
                 if is_heading {
                     flow.y -= size * 0.18;
+                    // H1 gets a short accent underline; other headings don't.
+                    if (size - fs * 2.0).abs() < f32::EPSILON {
+                        flow.y -= 4.0;
+                        let end_x = (left + 110.0).min(max_x);
+                        items.push(LaidItem::Rect(LaidRect {
+                            x0: left,
+                            y0: flow.y + 1.1,
+                            x1: end_x,
+                            y1: flow.y - 1.1,
+                            rgb: ACCENT_RGB,
+                            stroke: false,
+                        }));
+                    }
                 }
                 first_block = false;
                 i += 1;
@@ -3962,65 +4705,171 @@ impl PdfBuilder {
         // introduced. Successive runs on one line share `y`; `first`
         // resets the horizontal pen, and each run advances it by its real
         // measured width so inline style changes stay visually contiguous.
+        //
+        // Panels (LaidItem::Rect) never drive page assignment: they queue
+        // in `pending` and attach to the page of the next text/rule that
+        // follows them, so a panel whose block starts a fresh page moves
+        // with it. Within a page, rects render first (under everything),
+        // then rules, then text — fill under grid under glyphs.
+        //
+        // The +0.5pt epsilon on the rise check absorbs float drift between
+        // rules that share a y by construction (e.g. a table's top border
+        // at `flow.y` vs vertical separators at `row_top = flow.y + h`,
+        // ~1e-4 apart) — a real page restart jumps hundreds of points.
         // ------------------------------------------------------------------
         {
-            let mut page = builder
-                .page(self.config.page_size)
-                .font(body_font, self.config.font_size);
+            let mut pages_items: Vec<Vec<&LaidItem>> = vec![Vec::new()];
             let mut last_y = f32::MAX;
-            let mut pen_x = left;
+            let mut pending: Vec<&LaidItem> = Vec::new();
 
-            for item in items {
-                let y = match &item {
-                    LaidItem::Text(t) => t.y,
-                    LaidItem::Rule(r) => r.y0,
-                };
-                if y > last_y {
-                    page.done();
-                    page = builder
-                        .page(self.config.page_size)
-                        .font(body_font, self.config.font_size);
-                }
+            for item in &items {
                 match item {
-                    LaidItem::Text(run) => {
-                        if run.first {
-                            pen_x = run.x0;
+                    LaidItem::Rect(_) => pending.push(item),
+                    LaidItem::Text(t) => {
+                        if t.y > last_y + 0.5 {
+                            pages_items.push(Vec::new());
                         }
-                        page = page.font(run.font, run.size);
-                        let width = page.measure(&run.text);
-                        page = page.at(pen_x, run.y).text(&run.text);
-                        pen_x += width;
-                        last_y = run.y;
+                        last_y = t.y;
+                        let cur = pages_items.last_mut().unwrap();
+                        cur.append(&mut pending);
+                        cur.push(item);
                     },
                     LaidItem::Rule(r) => {
-                        let w = (r.x1 - r.x0).abs().max(0.35);
-                        let h = (r.y0 - r.y1).abs().max(0.35);
-                        page = page.element(ContentElement::Path(PathContent {
-                            bbox: Rect::new(r.x0.min(r.x1), r.y1.min(r.y0), w, h),
-                            operations: vec![
-                                PathOperation::MoveTo(r.x0, r.y0),
-                                PathOperation::LineTo(r.x1, r.y1),
-                            ],
-                            stroke_color: Some(crate::layout::Color {
-                                r: r.gray,
-                                g: r.gray,
-                                b: r.gray,
-                            }),
-                            fill_color: None,
-                            stroke_width: r.width,
-                            line_cap: crate::elements::LineCap::Butt,
-                            line_join: crate::elements::LineJoin::Miter,
-                            dash_pattern: None,
-                            matrix: None,
-                            reading_order: None,
-                            artifact_type: None,
-                            layer: None,
-                        }));
+                        if r.y0 > last_y + 0.5 {
+                            pages_items.push(Vec::new());
+                        }
                         last_y = r.y0;
+                        let cur = pages_items.last_mut().unwrap();
+                        cur.append(&mut pending);
+                        cur.push(item);
                     },
                 }
             }
-            page.done();
+            if !pending.is_empty() {
+                pages_items.last_mut().unwrap().append(&mut pending);
+            }
+
+            for page_items in pages_items {
+                if page_items.is_empty() {
+                    continue;
+                }
+                let mut page = builder
+                    .page(self.config.page_size)
+                    .font(body_font, self.config.font_size);
+                let mut pen_x = left;
+
+                // Panels under everything; stroked boxes too (checkboxes).
+                for item in &page_items {
+                    if let LaidItem::Rect(r) = item {
+                        let w = (r.x1 - r.x0).max(0.5);
+                        let h = (r.y0 - r.y1).max(0.5);
+                        if r.stroke {
+                            page = page.element(ContentElement::Path(PathContent {
+                                bbox: Rect::new(r.x0, r.y1, w, h),
+                                operations: vec![PathOperation::Rectangle(r.x0, r.y1, w, h)],
+                                stroke_color: Some(crate::layout::Color {
+                                    r: 0.45,
+                                    g: 0.45,
+                                    b: 0.45,
+                                }),
+                                fill_color: None,
+                                stroke_width: 0.75,
+                                line_cap: crate::elements::LineCap::Butt,
+                                line_join: crate::elements::LineJoin::Miter,
+                                dash_pattern: None,
+                                matrix: None,
+                                reading_order: None,
+                                artifact_type: None,
+                                layer: None,
+                            }));
+                        } else {
+                            page = page.filled_rect(r.x0, r.y1, w, h, r.rgb.0, r.rgb.1, r.rgb.2);
+                        }
+                    }
+                }
+                for item in page_items {
+                    match item {
+                        LaidItem::Rect(_) => {},
+                        LaidItem::Text(run) => {
+                            if run.first {
+                                pen_x = run.x0;
+                            }
+                            page = page.font(run.font, run.size);
+                            let width = page.measure(&run.text);
+                            if run.chip {
+                                page = page.filled_rect(
+                                    pen_x - 1.5,
+                                    run.y - 0.28 * run.size,
+                                    width + 3.0,
+                                    run.size * 1.42,
+                                    PANEL_RGB.0,
+                                    PANEL_RGB.1,
+                                    PANEL_RGB.2,
+                                );
+                            }
+                            page = page.at(pen_x, run.y);
+                            page = if run.rgb == (0.0, 0.0, 0.0) {
+                                page.text(&run.text)
+                            } else {
+                                page.text_colored(run.rgb.0, run.rgb.1, run.rgb.2, &run.text)
+                            };
+                            if run.strike {
+                                // Drawn after the glyphs so it cuts through
+                                // them, matching ~~strikethrough~~ intent.
+                                let sy = run.y + run.size * 0.26;
+                                page = page.element(ContentElement::Path(PathContent {
+                                    bbox: Rect::new(pen_x, sy, width, 0.5),
+                                    operations: vec![
+                                        PathOperation::MoveTo(pen_x, sy),
+                                        PathOperation::LineTo(pen_x + width, sy),
+                                    ],
+                                    stroke_color: Some(crate::layout::Color {
+                                        r: run.rgb.0,
+                                        g: run.rgb.1,
+                                        b: run.rgb.2,
+                                    }),
+                                    fill_color: None,
+                                    stroke_width: 0.75,
+                                    line_cap: crate::elements::LineCap::Butt,
+                                    line_join: crate::elements::LineJoin::Miter,
+                                    dash_pattern: None,
+                                    matrix: None,
+                                    reading_order: None,
+                                    artifact_type: None,
+                                    layer: None,
+                                }));
+                            }
+                            pen_x += width;
+                        },
+                        LaidItem::Rule(r) => {
+                            let w = (r.x1 - r.x0).abs().max(0.35);
+                            let h = (r.y0 - r.y1).abs().max(0.35);
+                            page = page.element(ContentElement::Path(PathContent {
+                                bbox: Rect::new(r.x0.min(r.x1), r.y1.min(r.y0), w, h),
+                                operations: vec![
+                                    PathOperation::MoveTo(r.x0, r.y0),
+                                    PathOperation::LineTo(r.x1, r.y1),
+                                ],
+                                stroke_color: Some(crate::layout::Color {
+                                    r: r.rgb.0,
+                                    g: r.rgb.1,
+                                    b: r.rgb.2,
+                                }),
+                                fill_color: None,
+                                stroke_width: r.width,
+                                line_cap: crate::elements::LineCap::Butt,
+                                line_join: crate::elements::LineJoin::Miter,
+                                dash_pattern: None,
+                                matrix: None,
+                                reading_order: None,
+                                artifact_type: None,
+                                layer: None,
+                            }));
+                        },
+                    }
+                }
+                page.done();
+            }
         }
 
         builder.build()
