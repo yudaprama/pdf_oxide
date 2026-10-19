@@ -1597,9 +1597,9 @@ mod tests {
         let space_w = font.char_width(' ');
         assert!((space_w - 278.0).abs() < 0.001);
 
-        // 'A' for Helvetica = 722
+        // 'A' for Helvetica = 667 (Adobe AFM; 722 is Helvetica-Bold)
         let a_w = font.char_width('A');
-        assert!((a_w - 722.0).abs() < 0.001);
+        assert!((a_w - 667.0).abs() < 0.001);
 
         // 'a' for Helvetica = 556
         let a_lower_w = font.char_width('a');
@@ -1821,7 +1821,7 @@ mod tests {
         let font = manager.get_font("Helvetica-Oblique").unwrap();
         // Same widths as Helvetica
         let a_w = font.char_width('A');
-        assert!((a_w - 722.0).abs() < 0.001);
+        assert!((a_w - 667.0).abs() < 0.001);
     }
 
     #[test]

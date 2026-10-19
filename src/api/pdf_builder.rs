@@ -4089,10 +4089,19 @@ impl PdfBuilder {
                     }
                 }
 
-                for (ci, lines) in wrapped.iter().enumerate() {
-                    let x_cell =
-                        left + widths[..ci].iter().sum::<f32>() + 2.0 * pad_x * ci as f32 + pad_x;
-                    for (li, line) in lines.iter().enumerate() {
+                // Line-major, column-minor: the emit pass infers a page
+                // break from a y-rise, so a row must reach it in strict
+                // descending-y order. Cell-major order (all of cell 0's
+                // lines, then all of cell 1's) rises back to `row_top`
+                // at every wrapped cell and would strand one cell per
+                // page.
+                for li in 0..max_lines {
+                    for (ci, lines) in wrapped.iter().enumerate() {
+                        let Some(line) = lines.get(li) else { continue };
+                        let x_cell = left
+                            + widths[..ci].iter().sum::<f32>()
+                            + 2.0 * pad_x * ci as f32
+                            + pad_x;
                         let line_w: f32 =
                             line.iter().map(|s| measure(&s.text, s.font, s.size)).sum();
                         let y = row_top - pad_y - (li as f32 + 0.82) * cell_lh;
@@ -5206,6 +5215,43 @@ End of table.
 "#;
         let result = Pdf::from_markdown(markdown);
         assert!(result.is_ok());
+    }
+
+    /// A table whose cells wrap must stay on one page. The emit pass
+    /// infers page breaks from a y-rise, so a row emitted cell-major
+    /// (every line of column 0, then every line of column 1) reads as a
+    /// page restart at each wrapped cell and strands one cell per page.
+    #[test]
+    fn test_wrapped_table_cells_do_not_split_pages() {
+        let markdown = "| Region | Q1 Revenue | Q1 Costs |\n\
+                        |---|---|---|\n\
+                        | EMEA | 1,204,000 | 930,000 |\n\
+                        | APAC | 1,010,000 | 1,100,000 |\n";
+        let mut pdf = Pdf::from_markdown(markdown).expect("markdown renders");
+        let bytes = pdf.save_to_bytes().expect("serializes");
+        let mut reopened = Pdf::from_bytes(bytes).expect("reopens");
+        assert_eq!(reopened.page_count().expect("page count"), 1);
+    }
+
+    /// Wide + long: rows that do not fit move whole to the next page
+    /// under a repeated header instead of exploding into one page per
+    /// cell (the pre-fix layout produced hundreds of near-empty pages).
+    #[test]
+    fn test_wide_table_pagination_keeps_rows_whole() {
+        let mut markdown = String::from(
+            "| Region | Q1 Revenue | Q1 Costs | Q1 Margin | Q2 Revenue | Q2 Costs | Q2 Margin | Owner |\n\
+             |---|---|---|---|---|---|---|---|\n",
+        );
+        for i in 0..40 {
+            markdown.push_str(&format!(
+                "| R{i} | 1,204,000 | 930,000 | 22.8% | 1,388,500 | 1,020,300 | 26.5% | Ana Sorensen |\n"
+            ));
+        }
+        let mut pdf = Pdf::from_markdown(&markdown).expect("markdown renders");
+        let bytes = pdf.save_to_bytes().expect("serializes");
+        let mut reopened = Pdf::from_bytes(bytes).expect("reopens");
+        let pages = reopened.page_count().expect("page count");
+        assert!((2..=6).contains(&pages), "unexpected page count {pages}");
     }
 
     #[test]
