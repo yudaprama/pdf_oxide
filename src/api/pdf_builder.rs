@@ -199,6 +199,29 @@ fn is_table_line(line: &str) -> bool {
     trimmed.starts_with('|') && trimmed.ends_with('|') && trimmed.len() > 2
 }
 
+/// A cell-level background directive: a GFM table cell that opens with
+/// `{bg:#rrggbb}` gets that fill painted behind it. Returns the cell text
+/// with the directive removed plus the parsed colour, so the directive
+/// never reaches measurement or the text run.
+fn strip_cell_bg(cell: &str) -> (String, Option<(f32, f32, f32)>) {
+    const PREFIX: &str = "{bg:#";
+    let trimmed = cell.trim_start();
+    if let Some(rest) = trimmed.strip_prefix(PREFIX) {
+        if let Some(end) = rest.find('}') {
+            let hex = &rest[..end];
+            if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                let channel = |i: usize| {
+                    u8::from_str_radix(&hex[i..i + 2], 16).unwrap_or(0) as f32 / 255.0
+                };
+                let rgb = (channel(0), channel(2), channel(4));
+                let text = trimmed[PREFIX.len() + end + 1..].trim_start().to_string();
+                return (text, Some(rgb));
+            }
+        }
+    }
+    (cell.to_string(), None)
+}
+
 /// An inline text run with its resolved emphasis, produced by
 /// [`parse_inline_runs`]. `code` wins over bold/italic — Markdown does not
 /// interpret emphasis inside a code span.
@@ -4018,7 +4041,8 @@ impl PdfBuilder {
 
             /// Draw one table row at the flow cursor. `bold` styles the
             /// whole row (header). `fill` paints a panel behind the row
-            /// (header tint / zebra stripe) under the grid lines.
+            /// (header tint / zebra stripe) under the grid lines; a
+            /// `cell_fills` entry paints that column's cell over it.
             /// Returns the row's top y.
             #[allow(clippy::too_many_arguments)]
             #[allow(clippy::type_complexity)]
@@ -4030,6 +4054,7 @@ impl PdfBuilder {
                 aligns: &[GfmAlign],
                 bold: bool,
                 fill: Option<Rgb>,
+                cell_fills: &[Option<Rgb>],
                 left: f32,
                 pad_x: f32,
                 pad_y: f32,
@@ -4077,6 +4102,22 @@ impl PdfBuilder {
                         rgb,
                         stroke: false,
                     }));
+                }
+                // Per-cell fills sit on top of the row panel, still under
+                // the grid lines and the text.
+                let mut cell_x = left;
+                for (ci, rgb) in cell_fills.iter().enumerate().take(ncols) {
+                    if let Some(rgb) = rgb {
+                        items.push(LaidItem::Rect(LaidRect {
+                            x0: cell_x,
+                            y0: row_top,
+                            x1: cell_x + widths[ci] + 2.0 * pad_x,
+                            y1: row_top - h,
+                            rgb: *rgb,
+                            stroke: false,
+                        }));
+                    }
+                    cell_x += widths[ci] + 2.0 * pad_x;
                 }
 
                 // Vertical separators, drawn per row so page breaks never
@@ -4239,13 +4280,37 @@ impl PdfBuilder {
                         let (pad_x, pad_y) = (5.0f32, 3.5f32);
                         let ncols = table.headers.len().max(1);
 
+                        // `{bg:#rrggbb}` cell directives are stripped before
+                        // measurement so they never widen a column or reach
+                        // the text run; the fills ride alongside the rows.
+                        let mut header_cells: Vec<String> = Vec::with_capacity(table.headers.len());
+                        let mut header_fills: Vec<Option<Rgb>> =
+                            Vec::with_capacity(table.headers.len());
+                        for cell in &table.headers {
+                            let (text, rgb) = strip_cell_bg(cell);
+                            header_cells.push(text);
+                            header_fills.push(rgb);
+                        }
+                        let mut rows: Vec<Vec<String>> = Vec::with_capacity(table.rows.len());
+                        let mut row_fills: Vec<Vec<Option<Rgb>>> =
+                            Vec::with_capacity(table.rows.len());
+                        for row in &table.rows {
+                            let mut cells = Vec::with_capacity(row.len());
+                            let mut fills = Vec::with_capacity(row.len());
+                            for cell in row {
+                                let (text, rgb) = strip_cell_bg(cell);
+                                cells.push(text);
+                                fills.push(rgb);
+                            }
+                            rows.push(cells);
+                            row_fills.push(fills);
+                        }
+
                         // Natural (single-line) and minimum (longest word)
                         // content widths per column.
                         let mut natural = vec![0.0f32; ncols];
                         let mut min_w = vec![0.0f32; ncols];
-                        for row in
-                            std::iter::once(&table.headers).chain(table.rows.iter())
-                        {
+                        for row in std::iter::once(&header_cells).chain(rows.iter()) {
                             for (ci, cell) in row.iter().enumerate().take(ncols) {
                                 let runs = parse_inline_runs(cell);
                                 natural[ci] = natural[ci]
@@ -4309,8 +4374,8 @@ impl PdfBuilder {
                                 0.35,
                             ));
                             draw_row(
-                                items, flow, &table.headers, &widths, &table.alignments, true,
-                                Some(THEAD_RGB),
+                                items, flow, &header_cells, &widths, &table.alignments, true,
+                                Some(THEAD_RGB), &header_fills,
                                 left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
                                 &measure, font_for_ref,
                             );
@@ -4318,7 +4383,7 @@ impl PdfBuilder {
                         };
                         draw_header(&mut items, &mut flow);
 
-                        for (ri, row) in table.rows.iter().enumerate() {
+                        for (ri, row) in rows.iter().enumerate() {
                             // Repeat the header on a fresh page when the
                             // next row cannot fit whole.
                             let need = row
@@ -4345,6 +4410,7 @@ impl PdfBuilder {
                             draw_row(
                                 &mut items, &mut flow, row, &widths, &table.alignments, false,
                                 if ri % 2 == 1 { Some(ZEBRA_RGB) } else { None },
+                                row_fills.get(ri).map(Vec::as_slice).unwrap_or(&[]),
                                 left, pad_x, pad_y, cell_fs, cell_lh, start_y, bottom,
                                 &measure, font_for_ref,
                             );
@@ -5190,6 +5256,41 @@ mod tests {
         assert!(rendered[1].contains("-"));
         assert!(rendered[2].contains("1"));
         assert!(rendered[2].contains("2"));
+    }
+
+    #[test]
+    fn cell_bg_directive_is_stripped_and_parsed() {
+        let (text, rgb) = super::strip_cell_bg("{bg:#fde8e8} Blocked");
+        assert_eq!(text, "Blocked");
+        let (r, g, b) = rgb.expect("directive parses");
+        assert!((r - 253.0 / 255.0).abs() < 1e-6);
+        assert!((g - 232.0 / 255.0).abs() < 1e-6);
+        assert!((b - 232.0 / 255.0).abs() < 1e-6);
+
+        let (text, rgb) = super::strip_cell_bg("Blocked");
+        assert_eq!(text, "Blocked");
+        assert!(rgb.is_none());
+
+        // Anything that is not a well-formed hex directive stays literal.
+        for malformed in ["{bg:red} Blocked", "{bg:#fde8} Blocked", "{bg:#fde8e8 Blocked"] {
+            let (text, rgb) = super::strip_cell_bg(malformed);
+            assert_eq!(text, malformed);
+            assert!(rgb.is_none());
+        }
+    }
+
+    #[test]
+    fn table_cell_bg_directive_never_reaches_the_text() {
+        let markdown = "| Item | Status |\n|---|---|\n\
+                        | Router | {bg:#fde8e8}Blocked |\n\
+                        | Battery | {bg:#f4f4f4}Not Started |\n";
+        let mut pdf = Pdf::from_markdown(markdown).expect("markdown renders");
+        let bytes = pdf.save_to_bytes().expect("serializes");
+        let doc = crate::PdfDocument::from_bytes(bytes).expect("reopens");
+        let text = doc.extract_text(0).expect("extract");
+        assert!(!text.contains("{bg:"), "directive leaked into text: {text}");
+        assert!(text.contains("Blocked"));
+        assert!(text.contains("Not Started"));
     }
 
     #[test]

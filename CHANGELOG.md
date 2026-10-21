@@ -2,6 +2,12 @@
 
 All notable changes to PDFOxide are documented here.
 
+## [Unreleased]
+
+### Added
+
+- **A GFM table cell can carry its own background, so a status column can be tinted without an HTML round-trip** — a cell that opens with `{bg:#rrggbb}` paints that fill behind the cell (over a zebra stripe, under the grid lines and the text) and the directive is stripped before measurement and emission, so it never widens a column or reaches the text layer. Written for the report case that used to need a browser: a wide table whose Blocked / Not started rows are highlighted. Unknown or malformed directives (`{bg:red}`, `{bg:#fde8}`, no closing brace) stay literal text rather than failing the render.
+
 ## [0.3.78] - 2026-09-09
 
 > Correctness under audit: 144 defects across rendering, text, reading order, files and colour
